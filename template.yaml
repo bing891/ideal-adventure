@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Node.js webapp stack with CloudFormation
+
+Parameters:
+  AmiID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: "The ID of the AMI."
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: dev
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: Choose which VPC the security groups should be deployed to
+  Subnets:
+    Description: Choose which subnets the Application Load Balancer should be deployed to
+    Type: List<AWS::EC2::Subnet::Id>
+  
+
+Resources:
+  WebAppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: us-east-1a
+      ImageId: !Ref AmiID
+      InstanceType: t2.micro        
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref SSHSecurityGroup
+        - !Ref ServerSecurityGroup
+      IamInstanceProfile: !Ref WebAppInstanceProfile
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash
+            yum update -y
+            amazon-linux-extras install docker
+            service docker start
+            usermod -a -G docker ec2-user
+            chkconfig docker on
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 702406258380.dkr.ecr.us-east-1.amazonaws.com
+            docker pull 702406258380.dkr.ecr.us-east-1.amazonaws.com/node10webapp:quest-node-app
+            docker run 702406258380.dkr.ecr.us-east-1.amazonaws.com/node10webapp:quest-node-app -p 80:80 -e SECRET_WORD=Impressive
+
+  SSHSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: 22
+        IpProtocol: tcp
+        ToPort: 22
+
+  # our second EC2 security group
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Accessing EC2 traffic should come from loadbalancer
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          IpProtocol: -1
+
+  WebAppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: Webapp-ec2-instance-profile
+      Path: /
+      Roles: 
+        - !Ref WebAppEc2InstanceRole
+
+  WebAppEc2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Webapp-ec2-instance-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+          -
+            Effect: Allow
+            Action: ecr:*
+            Resource: "*"
+      Path: /
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Access to the load balancer that sits in front of ECS
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref EnvironmentName
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALB1TargetGroup
+
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-default
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+
+  ALB1TargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: !Sub ${EnvironmentName}-Custom-tg
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPort: 3000
+      HealthCheckTimeoutSeconds: 3
+      HealthyThresholdCount: 2
+      Port: 3000
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 10
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VPC
+
+
+
+Outputs:
+  LoadBalancerUrl:
+    Description: The URL of the ALB
+    Value: !GetAtt LoadBalancer.DNSName
